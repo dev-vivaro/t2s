@@ -1,2 +1,2 @@
-# t2a
-Text 2 Audio Manager
+# t2s
+Text 2 Spech Manager
