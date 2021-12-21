@@ -194,7 +194,7 @@ EOF
           checksum=$(echo "${Mensaje_Texto}${Motor}${Voz[${TipoVoz}]}${IdEnvioPr}" | /usr/bin/md5sum | awk '{print $1}')
 
           # Check if audio file already exists
-          if [ ! -f ${AUDIOFILEDIR}/${checksum}.wav ]
+          if [ ! -f /mnt/Blaster/${checksum}.wav ]
           then
             DIRDONE=${TMFILEDIRDONE}/${IdCliente}/${IdEnvioPr}
             DIROUT=${TMFILEDIROUT}/${IdCliente}/${IdEnvioPr}
