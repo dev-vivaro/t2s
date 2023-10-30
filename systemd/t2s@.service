@@ -1,0 +1,15 @@
+[Unit]
+Description="T2S Manager Service #%i"
+After=network.target
+PartOf=t2s.target
+
+[Service]
+SyslogIdentifier=t2smanager%i
+User=asterisk
+Group=asterisk
+ExecStart=/opt/t2s/t2smanager -l %i
+Restart=on-failure
+RestartSec=60s
+
+[Install]
+WantedBy=multi-user.target

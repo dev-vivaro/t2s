@@ -1,0 +1,298 @@
+#!/bin/bash
+
+. /etc/opt/t2s/t2s.conf
+
+. ${TMDIR}/tools/functions
+
+usage() {
+echo "
+Usage:
+t2smanager [options]
+
+Options:
+-l                       Etiqueta (default=1)
+-m                       Max Rows to retrieve
+-p                       Http server port number
+-r                       Resultado (default=0)
+-x                       Print command traces
+" 1>&2
+exit 1;
+}
+
+trap f_killProcs SIGTERM SIGINT
+
+f_killProcs() {
+  Exit=true
+}
+
+setResultado() {
+  echo "UPDATE Blaster.dbo.EnviosBlaster SET Resultado = '$1' WHERE IdEnvioBlaster = $IdEnvioBlaster;" >> ${TMFILEDIRSQL}/${TIMESTAMP}.sql
+  if [ $1 -lt 0 ]
+  then
+    TmpErrors=$((TmpErrors + 1))
+  fi
+}
+
+setAudio() {
+  echo "UPDATE Blaster.dbo.EnviosBlaster SET RutaAudio = 'AUDIO', Mensaje_TTS = '$(echo ${Mensaje_TTS} | ${COMMONDIR}/ReplaceTextToAudio ${Audio[@]})' WHERE IdEnvioBlaster = $IdEnvioBlaster;" >> ${TMFILEDIRSQL}/${TIMESTAMP}.sql
+}
+
+Etiqueta=1
+Resultado=0
+[ -n $MaxRows ]  || MaxRows=100
+[ -n $SipTrunk ] || SipTrunk=trunkSBC
+[ -n $Context ]  || Context=from-internal
+Exit=false
+Tempo=0.9
+declare -A Voz
+Voz[F]=Sabina
+Voz[M]=Raul
+TipoVoz=F
+InValue=IN
+ETIQUETA_SQL=1
+
+while getopts ":l:m:r:x" o; do
+    case "${o}" in
+        l)
+            ETIQUETA=${OPTARG}
+            if [[ ${ETIQUETA} =~ "-" ]]
+            then
+              OFS=$IFS
+              IFS="-"
+              declare -a fields=(${ETIQUETA})
+              IFS=$OFS
+              unset OFS
+#              [ -n "${fields[0]}" ] && ETIQUETA_SQL=${fields[0]}
+              [ -n "${fields[0]}" ] && IDCLIENTE_SQL=${fields[0]}
+              [ -n "${fields[1]}" ] && INSTANCETOT=${fields[1]}
+              [ -n "${fields[2]}" ] && INSTANCENUM=${fields[2]}
+              ARCHIVO=${fields[0]}
+            else
+              ARCHIVO=${ETIQUETA}
+            fi
+            CONF=/etc/opt/t2s/t2s.${ARCHIVO}.conf
+            if [ ! -e ${CONF} ]
+            then
+              echo "Missing config file. Exiting."
+              exit 1
+            fi
+            . ${CONF}
+            ;;
+        m)
+            MaxRows=${OPTARG}
+            ;;
+        r)
+            Resultado=${OPTARG}
+            ;;
+        x)
+            set -x
+            ;;
+        *)
+            usage
+            ;;
+    esac
+done
+shift $((OPTIND-1))
+
+if [ -z "${Etiqueta}" ] || [ -z "${ETIQUETA_SQL}" ] || [ -z "${IDCLIENTE_SQL}" ] || [ -z "${INSTANCETOT}" ] || [ -z "${INSTANCENUM}" ] || [ -z "${ETIQUETA}" ]
+then
+  echo "Missing config parameters. Exiting."
+  usage
+fi
+
+SHMFILEDIR=/dev/shm
+SHMFILEDIRTM=${SHMFILEDIR}/t2s
+SHMFILEDIRLBL=${SHMFILEDIRTM}/${Etiqueta}/${ETIQUETA}
+AUDIOFILEDIR=${TMVARDIR}/audios
+TMFILEDIRDONE=${TMVARDIR}/outgoing_done/${Etiqueta}/${ETIQUETA}
+TMFILEDIROUT=${TMVARDIR}/outgoing_out/${Etiqueta}/${ETIQUETA}
+TMFILEDIRSQL=${TMVARDIR}/outgoing_sql/${Etiqueta}/${ETIQUETA}
+TMFILEDIRSQLDONE=${TMVARDIR}/outgoing_sql_done/${Etiqueta}/${ETIQUETA}
+TMFILEDIRSQLOUT=${TMVARDIR}/outgoing_sql_out/${Etiqueta}/${ETIQUETA}
+BLASTERAUDIODIR=/var/lib/asterisk/sounds/blaster
+
+declare -A countCurr
+
+[ -d ${SHMFILEDIRTM} ]     || mkdir -p ${SHMFILEDIRTM}
+[ -d ${SHMFILEDIRLBL} ]    || mkdir -p ${SHMFILEDIRLBL}
+[ -d ${AUDIOFILEDIR} ]     || mkdir -p ${AUDIOFILEDIR}
+[ -d ${TMFILEDIRDONE} ]    || mkdir -p ${TMFILEDIRDONE}
+[ -d ${TMFILEDIROUT} ]     || mkdir -p ${TMFILEDIROUT}
+[ -d ${TMFILEDIRSQL} ]     || mkdir -p ${TMFILEDIRSQL}
+[ -d ${TMFILEDIRSQLDONE} ] || mkdir -p ${TMFILEDIRSQLDONE}
+[ -d ${TMFILEDIRSQLOUT} ]  || mkdir -p ${TMFILEDIRSQLOUT}
+[ -f ${SHMFILEDIRLBL}/t2smanager ] && eval `cat ${SHMFILEDIRLBL}/t2smanager` || echo "status[cm]=Up;countCurr[Records]=0;countCurr[CallFiles]=0;countCurr[Errors]=0" > ${SHMFILEDIRLBL}/t2smanager
+# Create remote working directory
+#ssh ttseng@${TTSSERVER} "mkdir Documents\voice\\${Etiqueta}"
+
+f_seek() {
+
+  declare -A gaugeCurr
+  declare -A TotalRows
+
+  TmpRecords=0
+  TmpTTSFiles=0
+  TmpErrors=0
+
+  TODAY=$(date +%F)
+
+  cat << EOF >                     ${SHMFILEDIRLBL}/t2smanager.sql
+SET NOCOUNT ON;
+SELECT top ${MaxRows}
+  'IdCliente=',A.IdCliente,
+  ';IdEnvioPr=',A.IdEnvioPr,
+  ';IdEnvioBlaster=',A.IdEnvioBlaster,
+  ';Motor=',A.Motor_TTS,
+  ';TipoVoz=''',C.TipoVoz,'''',
+  ';Mensaje_TTS=''',REPLACE(REPLACE(REPLACE(A.Mensaje_TTS,char(39),''),char(13)+char(10),' '),char(10),' '),''''
+FROM dbo.EnviosBlaster A WITH (NOLOCK)
+INNER JOIN dbo.HorariosBlaster B WITH (NOLOCK) ON A.IdEnvioPr = B.IdEnvioPr
+INNER JOIN dbo.EnvioPrBlaster C WITH (NOLOCK) ON A.IdEnvioPr = C.IdEnvioPr
+WHERE A.FechaEnvio >= '${TODAY} 00:00:00' AND A.Resultado = 0 AND A.Etiqueta = ${ETIQUETA_SQL} AND A.IdCliente ${InValue} (${IDCLIENTE_SQL}) AND (CAST((A.Telefono) as bigint) % ${INSTANCETOT}) = ${INSTANCENUM} AND C.Activo = 1 AND A.RutaAudio = 'AUDIOTEXTO'
+ORDER BY B.FechaFin,B.FechaInicio;
+EOF
+#ORDER BY B.FechaFin,cast(DATEDIFF(s,B.FechaInicio,B.FechaFin) as bigint);
+
+  # If the total number of rows to be fetched is greater than zero, then proceed, otherwise, skip.
+  if [ ${MaxRows} -gt 0 ]
+  then
+    OFS=$IFS
+    IFS="
+"
+    TIMESTAMP=`date +%Y%m%d%H%M%S%N`
+
+    WgetResult=1
+    while [ "${WgetResult}" != "0" ]
+    do
+      [ -e ${SHMFILEDIRLBL}/t2smanager.out ] && rm ${SHMFILEDIRLBL}/t2smanager.out
+      wget -q --post-file=${SHMFILEDIRLBL}/t2smanager.sql --output-document=${SHMFILEDIRLBL}/t2smanager.out http://localhost/dbQueryBlaster.php
+      WgetResult=$?
+      if [ "${WgetResult}" != "0" ]
+      then
+        echo "Problems with dbQueryBlaster: ${WgetResult}"
+        sleep 1
+      fi
+    done
+
+    for pline in $(cat ${SHMFILEDIRLBL}/t2smanager.out)
+    do
+      TmpRecords=$((TmpRecords + 1))
+      if [ "$pline" != "" ]
+      then
+
+        unset tts Audio IdCliente IdEnvioPr IdEnvioBlaster Motor TipoVoz Mensaje_TTS
+
+        eval ${pline//¬/}
+
+        eval $(echo ${Mensaje_TTS} | ${COMMONDIR}/JsonToArray tts)
+
+        for i in "${!tts[@]}"
+        do
+
+          Mensaje_Texto="${tts[${i}]}"
+
+          checksum=$(echo "${Mensaje_Texto}${Motor}${Voz[${TipoVoz}]}${IdEnvioPr}" | /usr/bin/md5sum | awk '{print $1}')
+
+          # Check if audio file already exists
+          if [ ! -f /mnt/Blaster/${checksum}.wav ]
+          then
+            DIRDONE=${TMFILEDIRDONE}/${IdCliente}/${IdEnvioPr}
+            DIROUT=${TMFILEDIROUT}/${IdCliente}/${IdEnvioPr}
+            [ -d ${DIRDONE} ] || mkdir -p ${DIRDONE}
+            [ -d ${DIROUT} ] || mkdir -p ${DIROUT}
+            echo "${Mensaje_Texto}" > ${DIRDONE}/${IdEnvioBlaster}.txt
+
+            scp_status=1
+            while [ ${scp_status} -eq 1 ]
+            do             
+              # Send to MS TTS Engine
+              scp ${DIRDONE}/${IdEnvioBlaster}.txt ttseng@${TTSSERVER}:Documents/text/
+#              cp ${DIRDONE}/${IdEnvioBlaster}_${i}.txt /mnt/Blaster/text/
+
+              # Call MS TTS Engine
+              ssh ttseng@${TTSSERVER} "Documents\balcon.exe -enc utf8 -n ${Voz[${TipoVoz}]} -f Documents\text\\${IdEnvioBlaster}.txt -w Documents\voice\\${Etiqueta}\\${checksum}.wav"
+#              ssh ttseng@${TTSSERVER} "C:\\Users\\ttseng\\Documents\\balcon.exe -enc utf8 -n ${Voz[${TipoVoz}]} -f Z:\\text\\${IdEnvioBlaster}_${i}.txt -w Z:\\${checksum}.wav"
+
+              # Go get voice file
+              scp ttseng@${TTSSERVER}:Documents/voice/${Etiqueta}/${checksum}.wav /mnt/Blaster/${checksum}.wav
+
+              if [ -f /mnt/Blaster/${checksum}.wav ]
+              then
+                scp_status=0
+#                sox /mnt/Blaster/${checksum}.wav -r 8000 -c1 ${AUDIOFILEDIR}/${checksum}.wav
+#                mv ${AUDIOFILEDIR}/${checksum}.wav /mnt/Blaster/${checksum}.wav
+              else
+                echo "File Not Found. Retrying....."
+              fi
+
+            done
+ 
+          fi
+
+          Audio[${i}]="/mnt/Blaster/${checksum}.wav"
+
+        done
+
+        # Set voice filename
+        setAudio
+
+      else
+        echo "Nothing to do"
+      fi
+    done
+
+    IFS=$OFS
+
+    if [ -e ${TMFILEDIRSQL}/${TIMESTAMP}.sql ]
+    then
+      SqlcmdResult=1
+      while [ "${SqlcmdResult}" != "0" ]
+      do
+        ${SQLCMD} -S ${SQLSERVER} -U ${SQLCMDUSER} -P ${SQLCMDPASSWORD} -d ${SQLCMDDBNAME} -h -1 -W -i ${TMFILEDIRSQL}/${TIMESTAMP}.sql &> ${TMFILEDIRSQLOUT}/${TIMESTAMP}.out
+        SqlcmdResult=$?
+        if [ "${SqlcmdResult}" != "0" ]
+        then
+          echo "Problems with MSSQL Server: ${SqlcmdResult}"
+          sleep 1
+        fi
+      done
+      mv ${TMFILEDIRSQL}/${TIMESTAMP}.sql ${TMFILEDIRSQLDONE}/${TIMESTAMP}.sql
+      SqlFiles=$((SqlFiles + 1))
+    fi
+
+    if [ ${TmpRecords} -gt 0 ]
+    then
+      countCurr[Records]=$((countCurr[Records] + TmpRecords))
+      countCurr[SqlFiles]=$((countCurr[SqlFiles] + TmpSqlFiles))
+      countCurr[Errors]=$((countCurr[Errors] + TmpErrors))
+      echo "Records=${TmpRecords};SqlFiles=${SqlFiles};Errors=${TmpErrors}"
+    fi
+    echo "status[cm]=Up;countCurr[Records]=${countCurr[Records]};countCurr[CallFiles]=${countCurr[CallFiles]};countCurr[Errors]=${countCurr[Errors]}" > /dev/shm/t2smanager.${Etiqueta}
+
+  fi
+
+  unset gaugeCurr
+  unset TotalRows
+
+  return 0
+
+}
+
+#httpServer &
+#myHttpServer=$!
+
+while [ $Exit = false ]
+do
+  f_seek
+  EXITCODE=$?
+  case "${EXITCODE}" in
+    107)
+          echo "curl: (7)" 
+          ;;
+  esac
+  [ $TmpRecords -eq 0 ] && sleep 5
+done
+
+echo "Graceful shutdown!"
+
+exit 0
