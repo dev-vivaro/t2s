@@ -1,0 +1,11 @@
+[Unit]
+Description=TTS Surveys Motor.
+
+[Service]
+Type=simple
+ExecStart=/opt/t2s/t2squestionsmanager
+User=asterisk
+Group=asterisk
+
+[Install]
+WantedBy=multi-user.target
